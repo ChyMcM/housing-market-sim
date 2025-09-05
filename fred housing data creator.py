@@ -2,7 +2,7 @@ import pandas as pd
 from fredapi import Fred
 
 # Put your FRED API key here
-fred = Fred(api_key="e8d93ec1cc7427150b972ef2b038717d")
+fred = Fred(api_key="yourfredapikey")
 
 # Series codes from FRED
 series = {
@@ -33,4 +33,5 @@ df = df.reset_index().rename(columns={"index": "date"})
 df.to_csv("real_housing_data.csv", index=False)
 
 print("Saved real_housing_data.csv with shape:", df.shape)
+
 print(df.head())
