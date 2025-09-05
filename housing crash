@@ -1,0 +1,234 @@
+import argparse
+import os
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss, precision_recall_curve
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def pct_change(series, months=12):
+    return series.pct_change(months)
+
+def volatility(series, window=12):
+    return series.pct_change().rolling(window).std()
+
+def future_drawdown(series, horizon=12):
+    """
+    Percent drawdown from current value to the minimum over the next `horizon` periods.
+    Returns negative numbers for drops.
+    """
+    fut_min = series.shift(-1).rolling(horizon, min_periods=1).min()
+    return (fut_min / series) - 1.0
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a standard feature set from columns:
+      - HPI, RATE_30Y, UNEMP, INVENTORY, PERMITS, INCOME, RENT_INDEX
+    Missing columns are skipped gracefully.
+    """
+    df = df.sort_values("date").reset_index(drop=True)
+    feat = pd.DataFrame()
+    feat["date"] = df["date"]
+    feat["HPI"] = df["HPI"]
+
+    feat["hpi_yoy"] = pct_change(df["HPI"], 12)
+    feat["hpi_mom"] = df["HPI"].pct_change()
+    feat["hpi_vol_12m"] = volatility(df["HPI"], 12)
+
+    if "INCOME" in df.columns:
+        feat["price_to_income"] = (df["HPI"] / df["INCOME"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    if "RENT_INDEX" in df.columns:
+        feat["price_to_rent"] = (df["HPI"] / df["RENT_INDEX"].replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    if "RATE_30Y" in df.columns:
+        feat["rate_level"] = df["RATE_30Y"]
+        feat["rate_chg_6m"] = df["RATE_30Y"].diff(6)
+    if "UNEMP" in df.columns:
+        feat["unemp_level"] = df["UNEMP"]
+        feat["unemp_trend_6m"] = df["UNEMP"].diff(6)
+    if "INVENTORY" in df.columns:
+        feat["inventory_level"] = df["INVENTORY"]
+        feat["inventory_trend_6m"] = df["INVENTORY"].diff(6)
+    if "PERMITS" in df.columns:
+        feat["permits_yoy"] = pct_change(df["PERMITS"], 12)
+
+    return feat
+
+def make_labels(df: pd.DataFrame, horizon=12, threshold=-0.05) -> pd.DataFrame:
+    """
+    Compute drawdown and binary crash label, merge with features.
+    """
+    feat = build_features(df)
+
+    dd = future_drawdown(df["HPI"], horizon=horizon)
+    feat["drawdown_next_%dm" % horizon] = dd
+    feat["crash_next_%dm" % horizon] = (dd <= threshold).astype(int)
+
+    # Drop rows with missing core engineered fields or labels
+    needed_cols = ["hpi_yoy", "hpi_mom", "hpi_vol_12m", "drawdown_next_%dm" % horizon, "crash_next_%dm" % horizon]
+    feat = feat.dropna(subset=[c for c in needed_cols if c in feat.columns])
+
+    return feat
+
+def generate_synthetic(n_months=180, seed=42) -> pd.DataFrame:
+    """Generate a synthetic monthly dataset with basic housing-like series."""
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2012-01-01", periods=n_months, freq="M")
+
+    hpi = np.cumprod(1 + rng.normal(0.002, 0.012, n_months)) * 200
+    # Inject a couple of negative shocks to create positives
+    for shock_month in [60, 120, 150]:
+        if shock_month < n_months:
+            hpi[shock_month:shock_month+3] *= (1 - rng.uniform(0.05, 0.12))
+
+    rate_30y = 3.5 + rng.normal(0, 0.2, n_months).cumsum()/50 + 0.6*np.sin(np.linspace(0, 10, n_months))
+    unemp = 5 + rng.normal(0, 0.1, n_months).cumsum()/20 + 0.25*np.sin(np.linspace(0, 6, n_months))
+    inventory = np.abs(4 + rng.normal(0, 0.3, n_months).cumsum()/30)
+    permits = np.cumprod(1 + rng.normal(0.001, 0.02, n_months)) * 1000
+    income = np.linspace(3800, 6000, n_months) + rng.normal(0, 60, n_months)
+    rent_index = np.linspace(95, 175, n_months) + rng.normal(0, 2.5, n_months)
+
+    df = pd.DataFrame({
+        "date": dates,
+        "HPI": hpi,
+        "RATE_30Y": rate_30y,
+        "UNEMP": unemp,
+        "INVENTORY": inventory,
+        "PERMITS": permits,
+        "INCOME": income,
+        "RENT_INDEX": rent_index
+    })
+    return df
+
+def train_evaluate(df_feat: pd.DataFrame, horizon=12, threshold=-0.05, n_splits=5, proba_threshold=0.30):
+    """
+    Walk-forward training with prefit, time-aware calibration when possible.
+    """
+    label_col = "crash_next_%dm" % horizon
+    drop_cols = ["date", label_col, "drawdown_next_%dm" % horizon, "HPI"]
+    y = df_feat[label_col].astype(int).reset_index(drop=True)
+    X = df_feat.drop(columns=[c for c in drop_cols if c in df_feat.columns]).reset_index(drop=True)
+
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    oof = np.full(len(y), np.nan)
+
+    for fold, (train_idx, test_idx) in enumerate(tscv.split(X), 1):
+        X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+        X_test = X.iloc[test_idx]
+
+        # If training is single-class, skip this fold
+        if y_train.nunique() < 2:
+            continue
+
+        base_pipe = Pipeline([
+            ("impute", SimpleImputer(strategy="median")),
+            ("scale",  StandardScaler(with_mean=False)),
+            ("gb",     GradientBoostingClassifier(random_state=0))
+        ])
+
+        base_pipe.fit(X_train, y_train)
+
+        # Time-aware calibration: last 20% of training window
+        cal_len = max(20, int(len(train_idx) * 0.2))
+        cal_idx = train_idx[-cal_len:]
+        X_cal, y_cal = X.iloc[cal_idx], y.iloc[cal_idx]
+
+        if len(np.unique(y_cal)) >= 2:
+            calibrator = CalibratedClassifierCV(base_pipe, method="sigmoid", cv="prefit")
+            calibrator.fit(X_cal, y_cal)
+            proba = calibrator.predict_proba(X_test)[:, 1]
+        else:
+            proba = base_pipe.predict_proba(X_test)[:, 1]
+
+        oof[test_idx] = proba
+
+    mask = ~np.isnan(oof)
+    y_true = y[mask].values
+    y_score = oof[mask]
+
+    metrics = {}
+    if len(np.unique(y_true)) >= 2:
+        metrics["ROC_AUC"] = roc_auc_score(y_true, y_score)
+        metrics["PR_AUC"] = average_precision_score(y_true, y_score)
+    metrics["Brier"] = brier_score_loss(y_true, y_score)
+
+    # Thresholded confusion-like summary
+    preds = (y_score >= proba_threshold).astype(int)
+    tp = int(((preds == 1) & (y_true == 1)).sum())
+    fp = int(((preds == 1) & (y_true == 0)).sum())
+    tn = int(((preds == 0) & (y_true == 0)).sum())
+    fn = int(((preds == 0) & (y_true == 1)).sum())
+
+    summary = {
+        "n_obs": int(mask.sum()),
+        "class_balance": float(y.mean()),
+        "threshold": proba_threshold,
+        "TP": tp, "FP": fp, "TN": tn, "FN": fn
+    }
+
+    return metrics, summary, pd.DataFrame({"oof_proba": y_score, "oof_true": y_true})
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", type=str, default="synthetic_housing_data.csv",
+                        help="CSV path with at least 'date' and 'HPI' columns. If not found, synthetic data will be generated.")
+    parser.add_argument("--horizon", type=int, default=12, help="Months ahead for drawdown/crash label.")
+    parser.add_argument("--threshold", type=float, default=-0.05, help="Crash threshold (e.g., -0.05 for -5%%).")
+    parser.add_argument("--n_splits", type=int, default=5, help="TimeSeriesSplit splits.")
+    parser.add_argument("--proba_threshold", type=float, default=0.30, help="Signal threshold on predicted probabilities.")
+    args = parser.parse_args()
+
+    # Load or generate data
+    if os.path.exists(args.input):
+        df = pd.read_csv(args.input, parse_dates=["date"])
+    else:
+        print(f"[info] '{args.input}' not found. Generating synthetic dataset...")
+        df = generate_synthetic()
+        df.to_csv(args.input, index=False)
+        print(f"[info] Synthetic data written to {args.input}")
+
+    # Basic checks
+    if "date" not in df.columns or "HPI" not in df.columns:
+        raise ValueError("Input CSV must include 'date' (parseable) and 'HPI' columns.")
+
+    # Features + labels
+    feat = make_labels(df, horizon=args.horizon, threshold=args.threshold)
+
+    # Save engineered file
+    out_feat = f"features_labels_h{args.horizon}_{int(abs(args.threshold)*100)}pct.csv"
+    feat.to_csv(out_feat, index=False)
+    print(f"[info] Engineered features & labels saved to: {out_feat}")
+    print(f"[info] Class balance (positives): {feat[f'crash_next_{args.horizon}m'].mean():.3f} "
+          f"({feat[f'crash_next_{args.horizon}m'].sum()} of {len(feat)})")
+
+    # Train & evaluate
+    metrics, summary, oof = train_evaluate(feat, horizon=args.horizon, threshold=args.threshold,
+                                           n_splits=args.n_splits, proba_threshold=args.proba_threshold)
+
+    print("\n=== Metrics (OOF) ===")
+    for k,v in metrics.items():
+        print(f"{k}: {v:.4f}")
+    print("\n=== Thresholded summary ===")
+    for k,v in summary.items():
+        print(f"{k}: {v}")
+
+    # Save OOF predictions
+    oof_path = f"oof_preds_h{args.horizon}_{int(abs(args.threshold)*100)}pct.csv"
+    oof.to_csv(oof_path, index=False)
+    print(f"\n[info] Out-of-fold predictions saved to: {oof_path}")
+    print("\nDone.")
+
+if __name__ == "__main__":
+    main()
